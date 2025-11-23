@@ -13,6 +13,8 @@ import { Twilio } from 'twilio';
 import * as dotenv from 'dotenv';
 import { randomInt } from 'crypto';
 import { User, UserDocument } from './schema/users.schema';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import type { Cache } from 'cache-manager';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 // import { JwtService } from '@nestjs/jwt';
@@ -26,9 +28,14 @@ export class UsersService {
   private readonly logger = new Logger(UsersService.name);
   // private readonly jwtAuthService: JwtAuthService;
   constructor(
-    @InjectModel(User.name) private userModel: Model<UserDocument>,
+    @InjectModel(User.name)
+    private userModel: Model<UserDocument>,
+
     @Inject(forwardRef(() => JwtAuthService))
-    private readonly jwtAuthService: JwtAuthService
+    private readonly jwtAuthService: JwtAuthService,
+
+    @Inject(CACHE_MANAGER)
+    private readonly cacheManager: Cache,
   ) {
     // Initialize Twilio client
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -36,17 +43,31 @@ export class UsersService {
     this.twilioClient = new Twilio(accountSid, authToken);
     this.verifyServiceSid = process.env.TWILIO_VERIFY_SERVICE_SID;
   }
+  private getUserCacheKeyById(_id: string) {
+    return `user:id:${_id}`;
+  }
 
-  // Method to generate OTP
-  private generateOtp(): string {
-    const otp = randomInt(100000, 999999).toString(); // Generate a 6-digit OTP
-    return otp;
+  private getUserCacheKeyByPhone(phoneNumber: string) {
+    return `user:phone:${phoneNumber}`;
   }
   async findPhone(phoneNumber: string) {
-    // Implement logic to find if the phone number exists in your database
-    const user = await this.userModel.findOne({ phone: phoneNumber });
-    console.log('User found with phone number:', user);
+    const key = this.getUserCacheKeyByPhone(phoneNumber);
+    //Try Redis Cache first
+    const cached = await this.cacheManager.get<any>(key);
+    console.log("find cache data", cached)
+    if (cached) {
+      return cached;
+    }
+    //fall back to DB
+    const user = await this.userModel.findOne({ phoneNumber: phoneNumber }).exec();
+    // Cache the user data for future requests
+    if (user) {
+      await this.cacheManager.set(key, user,);
+      const idKey = this.getUserCacheKeyById(String(user['_id']));
+      await this.cacheManager.set(idKey, user);
+    }
     return user;
+
   }
   // Method to send OTP via SMS using Twilio
   async sendOtpToMobile(phoneNumber: string): Promise<void> {
@@ -72,30 +93,43 @@ export class UsersService {
   }
   async verifyOtp(phoneNumber: string, code: string) {
     console.log('verifyOtp called with:', phoneNumber, code);
+
     const verification = await this.twilioClient.verify.v2
       .services(this.verifyServiceSid)
       .verificationChecks.create({ code: code, to: phoneNumber });
     console.log('VERIFICATION:', verification);
     if (verification.status !== 'approved') {
       return { msg: 'not verified' };
-    } else {
-      const findPhoneQuery = { phoneNumber: phoneNumber }; // change to { phoneNumber: phoneNumber } if your schema uses phoneNumber
-      const user = await this.userModel.findOne(findPhoneQuery).exec();
-      console.log('User found during OTP verification:', user);
+    }
+    else {
+
+      let user = await this.findPhone(phoneNumber);
       if (!user) {
-        console.log('User with this phone number does not exist');
+        console.log('User with this phone number does not exist\n');
         const newUser = new this.userModel({ phoneNumber: phoneNumber });
-        await newUser.save();
-        //give token with limited access
-        // const tokenObj = await this.jwtAuthService.createtokenForUser(newUser);
-        console.log('New user created with phone number:', phoneNumber);
+        const createUser = await newUser.save();
         this.logger.log(`Created new user for ${phoneNumber}`);
+
+        const plainUser = createUser.toObject();
+        console.log(plainUser, 'plainUser');
+
+        const idKey = this.getUserCacheKeyById(String(createUser._id));
+        const cachedId = await this.cacheManager.set(idKey, plainUser,);
+        console.log(plainUser, cachedId, 'cachedId and plainUser');
+
+
+        if (plainUser.phoneNumber) {
+          const phoneKey = this.getUserCacheKeyByPhone(String(plainUser.phoneNumber));
+          const cachedNumber = await this.cacheManager.set(phoneKey, plainUser);
+          console.log(plainUser, cachedNumber, 'cachedNumber and plainUser');
+        }
+        user = plainUser;
         return { message: 'User created', user };
-      } else if (user) {
+      }
+      else if (user) {
         //then let user login in system with it real name and issue JWT token
         console.log(
           'User logged in successfully with phone number:',
-          { user }
         );
       }
       const tokenObj = await this.jwtAuthService.createtokenForUser(user);
